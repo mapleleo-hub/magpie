@@ -1191,6 +1191,13 @@ func resultSaid(b aBlock) []aBlock {
 type anthropicDecoder struct {
 	server map[int]bool
 	whole  map[int]bool // the tool_use blocks whose start carried their input
+	// held are the tool_use starts kept back until their own block says
+	// something: an upstream may give every content_block_start of a turn
+	// before any block's input, and a start let through would close the
+	// item of the call before it while that call's arguments are still to
+	// come (#3945)
+	held map[int]string
+	open int // the index of the tool_use block given to the client last, -1 for none
 }
 
 func (d *anthropicDecoder) decode(data string, emit func(Event)) error {
@@ -1210,11 +1217,20 @@ func (d *anthropicDecoder) decode(data string, emit func(Event)) error {
 		case "content_block_start":
 			d.server[ev.Index] = ev.ContentBlock.Type == "server_tool_use"
 			d.whole[ev.Index] = false
+			if ev.ContentBlock.Type == "tool_use" && !fullInput(ev.ContentBlock.Input) {
+				// its input comes in deltas: a start given now would close
+				// the item of a call still waiting for its own
+				if d.open >= 0 && d.open != ev.Index {
+					d.held[ev.Index] = data
+					return nil
+				}
+				d.open = ev.Index
+			}
 			if ev.ContentBlock.Type == "tool_use" && fullInput(ev.ContentBlock.Input) {
 				if err := decodeAnthropic(data, emit); err != nil {
 					return err
 				}
-				d.whole[ev.Index] = true
+				d.whole[ev.Index], d.open = true, ev.Index
 				emit(Event{Kind: KToolArgs, Text: string(ev.ContentBlock.Input)})
 				return nil
 			}
@@ -1224,6 +1240,17 @@ func (d *anthropicDecoder) decode(data string, emit func(Event)) error {
 			}
 			if d.whole[ev.Index] && ev.Delta.Type == "input_json_delta" {
 				return nil // the input came whole already
+			}
+			if start, ok := d.held[ev.Index]; ok {
+				// its block speaks now: give the start, then this
+				delete(d.held, ev.Index)
+				d.open = ev.Index
+				if err := decodeAnthropic(start, emit); err != nil {
+					return err
+				}
+			}
+			if ev.Type == "content_block_stop" && d.open == ev.Index {
+				d.open = -1
 			}
 		}
 	}

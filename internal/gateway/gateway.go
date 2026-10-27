@@ -6526,7 +6526,7 @@ func decoder(proto provider.Protocol) func(data string, emit func(Event)) error 
 		d := &codeAssistDecoder{}
 		return d.decode
 	}
-	d := &anthropicDecoder{server: map[int]bool{}, whole: map[int]bool{}}
+	d := &anthropicDecoder{server: map[int]bool{}, whole: map[int]bool{}, held: map[int]string{}, open: -1}
 	return d.decode
 }
 
