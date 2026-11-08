@@ -79,7 +79,7 @@ const usage = `magpie — one place to pick every agent's model
   magpie s3 [on s3://<bucket>[/<prefix>]|set k=v…|now|off]   the same through an S3-compatible bucket: AWS, R2, B2, MinIO… (magpie s3 help)
   magpie github [on github://<owner>/<repo>[/<folder>]|set k=v…|now|off]   the same in an encrypted GitHub repository (magpie github help)
 
-  magpie library [sync|instructions|mcp|skill]   the instructions, MCP servers and skills written into every agent (magpie library help)
+  magpie library [sync|instructions|mcp|skill|hook|subagent]   the instructions, MCP servers, skills, hooks and subagents written into every agent (magpie library help)
 
   magpie providers                list your providers: host, key, models, who uses them
   magpie presets                  the vendors magpie knows: add one with just a key

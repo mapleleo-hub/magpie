@@ -1,6 +1,7 @@
 package library
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1044,9 +1045,9 @@ func targetByID(id string) *Target {
 }
 
 // Takes is the id of the agent q names (its id, an alias, its name) when
-// the library can give it kind — "instructions", "mcp" or "skills" — or
-// why not: an agent it has no place for isn't recorded as getting it and
-// then given nothing.
+// the library can give it kind — "instructions", "mcp", "skills", "hooks"
+// or "subagents" — or why not: an agent it has no place for isn't recorded
+// as getting it and then given nothing.
 func Takes(q, kind string) (string, error) {
 	var a *agent.Agent
 	for _, x := range apps() {
@@ -1061,7 +1062,7 @@ func Takes(q, kind string) (string, error) {
 			return "", err
 		}
 	}
-	what := map[string]string{"instructions": "instructions", "mcp": "MCP servers", "skills": "skills"}[kind]
+	what := map[string]string{"instructions": "instructions", "mcp": "MCP servers", "skills": "skills", "hooks": "hooks", "subagents": "subagents"}[kind]
 	// an app found by its program alone (Kiro CLI) that isn't here: told
 	// so, not recorded and then given nothing, as Targets leaves it out
 	if app && a.Bin != "" && !a.Detected() {
@@ -1072,8 +1073,17 @@ func Takes(q, kind string) (string, error) {
 	if a.CLIMissing() {
 		return "", fmt.Errorf("%s's CLI isn't installed here; nothing reads its %s until it is installed again%s", a.Name, what, takenBy(kind, what))
 	}
+	// no agent in WSL is given hooks or subagents, its distro running or
+	// not: said as that, not as a distro to start (hooks.go, subagents.go)
+	if a.WSL != "" && (kind == "hooks" || kind == "subagents") {
+		if kind == "hooks" {
+			return "", errors.New(wslNoHooks(a))
+		}
+		return "", errors.New(wslNoSubagents)
+	}
 	t := targetOf(a)
 	var has bool
+	var why string
 	if t == nil && isAsleep(a) {
 		// one magpie saw it give instructions, MCP servers or skills a
 		// place to is recorded, and given them when the distro next runs
@@ -1091,9 +1101,20 @@ func Takes(q, kind string) (string, error) {
 			has = t.MCP != nil
 		case "skills":
 			has = t.Skills != ""
+		case "hooks":
+			// only the agents magpie knows a hooks file for take one, and
+			// the spec says why an agent it knows none for doesn't
+			sp, w := hookSpecOf(t)
+			has, why = sp != nil, w
+		case "subagents":
+			sp, w := subagentSpecOf(t)
+			has, why = sp != nil, w
 		}
 	}
 	if !has {
+		if why != "" {
+			return "", fmt.Errorf("%s%s", why, takenBy(kind, what))
+		}
 		return "", fmt.Errorf("%s%s", noPlace(a, kind, what), takenBy(kind, what))
 	}
 	return a.ID, nil
@@ -1124,7 +1145,16 @@ func noPlace(a *agent.Agent, kind, what string) string {
 func takenBy(kind, what string) string {
 	var ids []string
 	for _, t := range Targets() {
-		if kind == "instructions" && t.Instructions != "" || kind == "mcp" && t.MCP != nil || kind == "skills" && t.Skills != "" {
+		takes := kind == "instructions" && t.Instructions != "" || kind == "mcp" && t.MCP != nil || kind == "skills" && t.Skills != ""
+		if kind == "hooks" {
+			sp, _ := hookSpecOf(t)
+			takes = sp != nil
+		}
+		if kind == "subagents" {
+			sp, _ := subagentSpecOf(t)
+			takes = sp != nil
+		}
+		if takes {
 			ids = append(ids, t.Agent.ID)
 		}
 	}

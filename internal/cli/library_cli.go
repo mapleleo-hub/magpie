@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"golang.org/x/term"
@@ -14,7 +16,7 @@ import (
 	"github.com/yetone/magpie/internal/library"
 )
 
-const libraryUsage = `magpie library                     what the library gives each agent: instructions, MCP servers, skills
+const libraryUsage = `magpie library                     what the library gives each agent: instructions, MCP servers, skills, hooks, subagents
   magpie library sync                write it into the agents again (after one is installed, or edited by hand)
   magpie library instructions        print the shared instructions
   magpie library instructions set <file|->   replace them with a file's text (- for stdin)
@@ -27,6 +29,18 @@ const libraryUsage = `magpie library                     what the library gives 
   magpie library mcp router on|off   give each agent one MCP server, magpie, in place of the library's (magpie runs them, once for every agent)
   magpie library mcp router <name> shared|direct   with the router on, share the server through it (the default) or keep it each
                                      agent's own entry, as with the router off: for one that reads its project from the folder it starts in
+  magpie library hook add <name> <event> <command…> [agents=a,b…] [--matcher=<m>] [--timeout=<sec>] [--description=<text>]
+                                     <event> is turn-end, after-tool, before-tool, prompt or session-start, or an agent's own as
+                                     <agent>:<Event>; a command with flags of its own goes after --  (magpie library hook events)
+  magpie library hook events         the portable events, and each agent's own name for them, with the agents that take hooks
+  magpie library hook set <name> …   the same as add, replacing the hook that name has
+  magpie library hook agents <name> <a,b…|none>
+  magpie library hook rm <name…>
+  magpie library subagent add <name> (--prompt=<text> | --prompt-file=<file|->) [--description=<text>] [agents=a,b…]
+                                     [--model=<model|group/id>] [--skills=a,b] [--mcp=a,b]
+  magpie library subagent set <name> …   the same as add, replacing the subagent that name has
+  magpie library subagent agents <name> <a,b…|none>
+  magpie library subagent rm <name…>
   magpie library skill agents <name> <a,b…|none>
   magpie library skill off-here <name>   turn it off on this computer only: a sync neither carries that nor turns it back on
   magpie library skill on-here <name>    …and on again here
@@ -51,8 +65,8 @@ const libraryUsage = `magpie library                     what the library gives 
   magpie library rtk path            put RTK on the PATH the agents get, when it isn't (their hooks run it by name)
 `
 
-// libraryCmd is magpie library …: the instructions, MCP servers and skills
-// magpie keeps once and writes into every agent.
+// libraryCmd is magpie library …: the instructions, MCP servers, skills, hooks
+// and subagents magpie keeps once and writes into every agent.
 func libraryCmd(args []string) error {
 	if len(args) < 2 {
 		return libraryStatus()
@@ -61,6 +75,9 @@ func libraryCmd(args []string) error {
 		res    *library.Result
 		err    error
 		unused string // a server just added that no agent is given
+		// lonely is a hook or subagent just added that no agent is given,
+		// and how to give it to them
+		lonely, lonelyHint string
 	)
 	switch sub, rest := args[1], args[2:]; sub {
 	case "sync":
@@ -215,6 +232,56 @@ func libraryCmd(args []string) error {
 		default:
 			return fmt.Errorf("usage:\n  %s", libraryUsage)
 		}
+	case "hook", "hooks":
+		switch {
+		case len(rest) == 1 && (rest[0] == "events" || rest[0] == "event"):
+			return hookEvents()
+		case len(rest) >= 1 && (rest[0] == "add" || rest[0] == "set"):
+			old := ""
+			var h library.Hook
+			if h, err = hookArgs(rest[1:]); err == nil {
+				if rest[0] == "set" {
+					old = h.Name
+				}
+				if len(h.Agents) == 0 {
+					lonely, lonelyHint = "hook "+h.Name, "magpie library hook agents "+h.Name+" <a,b…> gives it to them"
+				}
+				res, err = library.SaveHook(old, h)
+			}
+		case len(rest) == 3 && rest[0] == "agents":
+			var as []string
+			if as, err = libraryAgents(rest[2], "hooks"); err == nil {
+				res, err = library.HookAgents(rest[1], as)
+			}
+		case len(rest) >= 2 && rest[0] == "rm":
+			res, err = library.RemoveHooks(rest[1:])
+		default:
+			return fmt.Errorf("usage:\n  %s", libraryUsage)
+		}
+	case "subagent", "subagents":
+		switch {
+		case len(rest) >= 1 && (rest[0] == "add" || rest[0] == "set"):
+			old := ""
+			var s library.Subagent
+			if s, err = subagentArgs(rest[1:]); err == nil {
+				if rest[0] == "set" {
+					old = s.Name
+				}
+				if len(s.Agents) == 0 {
+					lonely, lonelyHint = "subagent "+s.Name, "magpie library subagent agents "+s.Name+" <a,b…> gives it to them"
+				}
+				res, err = library.SaveSubagent(old, s)
+			}
+		case len(rest) == 3 && rest[0] == "agents":
+			var as []string
+			if as, err = libraryAgents(rest[2], "subagents"); err == nil {
+				res, err = library.SubagentAgentsSet(rest[1], as)
+			}
+		case len(rest) >= 2 && rest[0] == "rm":
+			res, err = library.RemoveSubagents(rest[1:])
+		default:
+			return fmt.Errorf("usage:\n  %s", libraryUsage)
+		}
 	case "rtk":
 		return rtkCmd(rest)
 	case "help", "-h", "--help":
@@ -231,6 +298,12 @@ func libraryCmd(args []string) error {
 		// every agent having it already
 		fmt.Println(green.Render("✓"), unused, "is in the library, given to no agent yet")
 		fmt.Println(muted.Render("  magpie library mcp agents " + unused + " <a,b…> gives it to them"))
+		return nil
+	}
+	if lonely != "" && len(res.Changed) == 0 && len(res.Problems) == 0 {
+		// the same for a hook or subagent added with no agents=
+		fmt.Println(green.Render("✓"), lonely, "is in the library, given to no agent yet")
+		fmt.Println(muted.Render("  " + lonelyHint))
 		return nil
 	}
 	printLibraryResult(res)
@@ -378,6 +451,136 @@ func libraryAgents(s, kind string) ([]string, error) {
 	return out, nil
 }
 
+// hookArgs reads <name> <event> <command…>, with agents=a,b and --matcher=,
+// --timeout= and --description= anywhere before the command: a command with
+// flags of its own follows a lone --.
+func hookArgs(args []string) (library.Hook, error) {
+	usage := fmt.Errorf("usage:\n  magpie library hook add <name> <event> <command…> [agents=a,b…] [--matcher=<m>] [--timeout=<sec>] [--description=<text>]")
+	h := library.Hook{}
+	var words []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			words = append(words, args[i+1:]...)
+			break
+		}
+		switch {
+		case strings.HasPrefix(a, "agents="):
+			as, err := libraryAgents(strings.TrimPrefix(a, "agents="), "hooks")
+			if err != nil {
+				return h, err
+			}
+			h.Agents = as
+		case strings.HasPrefix(a, "--matcher="):
+			h.Matcher = strings.TrimPrefix(a, "--matcher=")
+		case strings.HasPrefix(a, "--description="):
+			h.Description = strings.TrimPrefix(a, "--description=")
+		case strings.HasPrefix(a, "--timeout="):
+			v := strings.TrimPrefix(a, "--timeout=")
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				return h, fmt.Errorf("--timeout takes a number of seconds, not %q", v)
+			}
+			h.Timeout = n
+		case strings.HasPrefix(a, "--"):
+			return h, fmt.Errorf("no such flag %s", a)
+		default:
+			words = append(words, a)
+		}
+	}
+	if len(words) < 3 {
+		return h, usage
+	}
+	h.Name, h.Event = words[0], words[1]
+	h.Command = strings.Join(words[2:], " ")
+	return h, nil
+}
+
+// subagentArgs reads <name> with --prompt= or --prompt-file= (- for stdin),
+// --description=, agents=a,b, --model=, --skills=a,b and --mcp=a,b.
+func subagentArgs(args []string) (library.Subagent, error) {
+	usage := fmt.Errorf("usage:\n  magpie library subagent add <name> (--prompt=<text> | --prompt-file=<file|->) [--description=<text>] [agents=a,b…] [--model=<model|group/id>] [--skills=a,b] [--mcp=a,b]")
+	s := library.Subagent{}
+	name := ""
+	havePrompt := false
+	for _, a := range args {
+		switch {
+		case strings.HasPrefix(a, "agents="):
+			as, err := libraryAgents(strings.TrimPrefix(a, "agents="), "subagents")
+			if err != nil {
+				return s, err
+			}
+			s.Agents = as
+		case strings.HasPrefix(a, "--description="):
+			s.Description = strings.TrimPrefix(a, "--description=")
+		case strings.HasPrefix(a, "--prompt="):
+			s.Prompt, havePrompt = strings.TrimPrefix(a, "--prompt="), true
+		case strings.HasPrefix(a, "--prompt-file="):
+			p := strings.TrimPrefix(a, "--prompt-file=")
+			var b []byte
+			var err error
+			if p == "-" {
+				b, err = io.ReadAll(stdin())
+			} else {
+				b, err = os.ReadFile(p)
+			}
+			if err != nil {
+				return s, err
+			}
+			s.Prompt, havePrompt = string(b), true
+		case strings.HasPrefix(a, "--model="):
+			s.Model = strings.TrimPrefix(a, "--model=")
+		case strings.HasPrefix(a, "--skills="):
+			s.Skills = namesIn(strings.TrimPrefix(a, "--skills="))
+		case strings.HasPrefix(a, "--mcp="):
+			s.MCP = namesIn(strings.TrimPrefix(a, "--mcp="))
+		case strings.HasPrefix(a, "--"):
+			return s, fmt.Errorf("no such flag %s", a)
+		default:
+			if name != "" {
+				return s, usage
+			}
+			name = a
+		}
+	}
+	if name == "" || !havePrompt {
+		return s, usage
+	}
+	s.Name = name
+	return s, nil
+}
+
+// namesIn is a,b,c as a list of names.
+func namesIn(s string) []string {
+	out := []string{}
+	for _, n := range strings.Split(s, ",") {
+		if n = strings.TrimSpace(n); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// hookEvents is magpie library hook events: the portable events, and each
+// agent's own names for its events, with why an agent takes none.
+func hookEvents() error {
+	fmt.Println(bold.Render("Portable events"))
+	fmt.Println(" ", strings.Join(library.HookEvents, ", "))
+	v, err := library.Read(nil)
+	if err != nil {
+		return err
+	}
+	fmt.Println(bold.Render("Agents that take hooks"))
+	for _, a := range v.HookAgents {
+		if a.WSL || a.No != "" {
+			fmt.Printf("  %s %s\n", bold.Render(a.ID), muted.Render(a.No))
+			continue
+		}
+		fmt.Printf("  %s %s\n", bold.Render(a.ID), muted.Render(strings.Join(a.Events, ", ")))
+	}
+	return nil
+}
+
 func printLibraryResult(res *library.Result) {
 	if len(res.Changed) == 0 {
 		fmt.Println(green.Render("✓"), "every agent already has it")
@@ -498,6 +701,34 @@ func libraryStatus() error {
 	}
 	if len(own) > 0 {
 		fmt.Println(" ", muted.Render("added by the agent itself, left as they are:"), strings.Join(own, ", "))
+	}
+	fmt.Println(bold.Render("Hooks"))
+	if len(v.Hooks) == 0 {
+		fmt.Println(" ", muted.Render("none yet · magpie library hook add <name> <event> <command…>"))
+	}
+	for _, h := range v.Hooks {
+		what := h.Event
+		if h.Matcher != "" {
+			what += " (" + h.Matcher + ")"
+		}
+		fmt.Printf("  %s %s %s → %s\n", bold.Render(h.Name), muted.Render(what), muted.Render(h.Command), on(h.Agents))
+		for _, a := range slices.Sorted(maps.Keys(h.Problems)) {
+			fmt.Println("   ", amber.Render("!"), muted.Render(a+": "), h.Problems[a])
+		}
+	}
+	fmt.Println(bold.Render("Subagents"))
+	if len(v.Subagents) == 0 {
+		fmt.Println(" ", muted.Render("none yet · magpie library subagent add <name> --prompt=<text>"))
+	}
+	for _, s := range v.Subagents {
+		what := s.Description
+		if s.Model != "" {
+			what += " · on " + s.Model
+		}
+		fmt.Printf("  %s %s → %s\n", bold.Render(s.Name), muted.Render(what), on(s.Agents))
+		for _, a := range slices.Sorted(maps.Keys(s.Problems)) {
+			fmt.Println("   ", amber.Render("!"), muted.Render(a+": "), s.Problems[a])
+		}
 	}
 	fmt.Println(bold.Render("Skills"))
 	if len(v.Skills) == 0 {
